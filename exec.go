@@ -2,7 +2,6 @@ package tea
 
 import (
 	"io"
-	"os"
 	"os/exec"
 )
 
@@ -47,8 +46,8 @@ func Exec(c ExecCommand, fn ExecCallback) Cmd {
 //	cmd := ExecProcess(exec.Command("vim", "file.txt"), nil)
 //
 // For non-interactive i/o you should use a Cmd (that is, a tea.Cmd).
-func ExecProcess(c *exec.Cmd, fn ExecCallback) Cmd {
-	return Exec(wrapExecCommand(c), fn)
+func ExecProcess(c *exec.Cmd, stdinProxy ReaderProxy, stdoutProxy WriterProxy, stderrProxy WriterProxy, fn ExecCallback) Cmd {
+	return Exec(wrapExecCommand(c, stdinProxy, stdoutProxy, stderrProxy), fn)
 }
 
 // ExecCallback is used when executing an *exec.Command to return a message
@@ -62,20 +61,60 @@ type ExecCommand interface {
 	SetStdin(io.Reader)
 	SetStdout(io.Writer)
 	SetStderr(io.Writer)
+	GetProxies() (ReaderProxy, WriterProxy, WriterProxy)
+}
+
+type ReaderProxy struct {
+	io.Reader
+	From    io.Reader
+	Handler func(b []byte, n int, err error)
+}
+
+func (s ReaderProxy) Read(b []byte) (n int, err error) {
+	n, err = s.From.Read(b)
+	s.Handler(b, n, err)
+	return n, err
+}
+
+// Stdout proxy
+type WriterProxy struct {
+	io.Writer
+	From    io.Writer
+	Handler func(b []byte, n int, err error)
+}
+
+func (s WriterProxy) Write(b []byte) (n int, err error) {
+	s.Handler(b, n, err)
+	n, err = s.From.Write(b)
+	return n, err
 }
 
 // wrapExecCommand wraps an exec.Cmd so that it satisfies the ExecCommand
 // interface so it can be used with Exec.
-func wrapExecCommand(c *exec.Cmd) ExecCommand {
-	return &osExecCommand{Cmd: c}
+func wrapExecCommand(c *exec.Cmd, stdinProxy ReaderProxy, stdoutProxy WriterProxy, stderrProxy WriterProxy) ExecCommand {
+	return &OsExecCommand{
+		Cmd:         c,
+		StdinProxy:  stdinProxy,
+		StdoutProxy: stdoutProxy,
+		StderrProxy: stderrProxy,
+	}
 }
 
 // osExecCommand is a layer over an exec.Cmd that satisfies the ExecCommand
 // interface.
-type osExecCommand struct{ *exec.Cmd }
+type OsExecCommand struct {
+	*exec.Cmd
+	StdinProxy  ReaderProxy
+	StdoutProxy WriterProxy
+	StderrProxy WriterProxy
+}
+
+func (c *OsExecCommand) GetProxies() (ReaderProxy, WriterProxy, WriterProxy) {
+	return c.StdinProxy, c.StdoutProxy, c.StderrProxy
+}
 
 // SetStdin sets stdin on underlying exec.Cmd to the given io.Reader.
-func (c *osExecCommand) SetStdin(r io.Reader) {
+func (c *OsExecCommand) SetStdin(r io.Reader) {
 	// If unset, have the command use the same input as the terminal.
 	if c.Stdin == nil {
 		c.Stdin = r
@@ -83,7 +122,7 @@ func (c *osExecCommand) SetStdin(r io.Reader) {
 }
 
 // SetStdout sets stdout on underlying exec.Cmd to the given io.Writer.
-func (c *osExecCommand) SetStdout(w io.Writer) {
+func (c *OsExecCommand) SetStdout(w io.Writer) {
 	// If unset, have the command use the same output as the terminal.
 	if c.Stdout == nil {
 		c.Stdout = w
@@ -91,7 +130,7 @@ func (c *osExecCommand) SetStdout(w io.Writer) {
 }
 
 // SetStderr sets stderr on the underlying exec.Cmd to the given io.Writer.
-func (c *osExecCommand) SetStderr(w io.Writer) {
+func (c *OsExecCommand) SetStderr(w io.Writer) {
 	// If unset, use stderr for the command's stderr
 	if c.Stderr == nil {
 		c.Stderr = w
@@ -108,9 +147,14 @@ func (p *Program) exec(c ExecCommand, fn ExecCallback) {
 		return
 	}
 
-	c.SetStdin(p.input)
-	c.SetStdout(p.output)
-	c.SetStderr(os.Stderr)
+	stdinProxy, stdoutProxy, stderrProxy := c.GetProxies()
+	stdinProxy.From = p.input
+	stdoutProxy.From = p.output
+	stderrProxy.From = p.output
+
+	c.SetStdin(stdinProxy)
+	c.SetStdout(stdoutProxy)
+	c.SetStderr(stderrProxy)
 
 	// Execute system command.
 	if err := c.Run(); err != nil {
